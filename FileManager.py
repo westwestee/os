@@ -2,9 +2,18 @@ import os
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from errno import ENOMEM, EINVAL, EBADF, EOPNOTSUPP
 from typing import Dict, List, Union, Optional
 import psutil
 
+from DeviceManager import DeviceManager
+from MemoryManager import MemoryManager
+from ProcessManager import ProcessManager
+
+# 定义错误码
+EPERM = 1    # 权限不足
+ENOENT = 2   # 文件不存在
+EIO = 3      # I/O 错误
 
 @dataclass
 class FileMeta:
@@ -24,13 +33,18 @@ class ProcessFileInfo:  # 描述进程打开的文件信息
     position: int  # 文件指针位置
 
 
-class SimulatedFileSystem:  # 初始化文件系统结构
-    def __init__(self):
+class FileManager:  # 初始化文件系统结构
+    def __init__(self, process_mgr, memory_mgr, device_mgr):
         self.fs = defaultdict(dict)  # 文件系统树结构,创建自动初始化嵌套字典的结构
         self.current_dir = ["C:"]  # 当前工作目录
         self.open_files = {}  # 打开文件表
         self.users = {"root": "admin", "user1": "password"}  # 用户数据库
         self.current_user = "root"  # 当前登录用户(默认root)
+        self.process_mgr = process_mgr  # 进程管理模块实例
+        self.memory_mgr = memory_mgr  # 内存管理模块实例
+        self.device_mgr = device_mgr  # 设备管理模块实例
+        # 新增内存映射表 {pid: {virtual_addr: (fd, file_offset)}}
+        self.memory_mappings = defaultdict(dict)
 
         # 初始化根目录
         self._create_dir(["C:"], FileMeta(
@@ -40,6 +54,120 @@ class SimulatedFileSystem:  # 初始化文件系统结构
             permissions="rwxr-xr-x",
             owner="root"
         ))
+
+    # ----------------------------
+    # 与进程管理的接口
+    # ----------------------------
+    def process_create_file(self, pid: int, path: str, permissions: str) -> int:
+        """进程请求创建文件（接口方法）"""
+        # 检查进程权限
+        if not self.process_mgr.validate_permission(pid, "file_create"):
+            raise PermissionError(f"Process {pid} lacks file creation permission")
+
+        try:
+            self.create_file(path, "")
+            # 更新文件权限
+            full_path = self._get_full_path([path])
+            target_dir = self._navigate_to_path(full_path[:-1])
+            target_dir[path]["_meta"].permissions = permissions
+            return 0  # 成功
+        except Exception as e:
+            print(f"Create file failed: {str(e)}")
+            return -1  # 错误码可细化
+
+    def process_open_file(self, pid: int, path: str, mode: str) -> int:
+        """进程级文件打开接口"""
+        # 检查进程的文件打开权限
+        if not self.process_mgr.validate_permission(pid, "file_open"):
+            return -EPERM
+
+        # 调用原有打开逻辑并记录进程关联
+        try:
+            fd = self.open_file(path, mode)
+            self.open_files[fd]["pid"] = pid  # 记录所属进程
+            return fd
+        except FileNotFoundError:
+            return -ENOENT
+
+    # ----------------------------
+    # 与内存管理的接口
+    # ----------------------------
+    def mmap_file(self, pid: int, fd: int, virtual_addr: int) -> int:
+        """将文件映射到进程虚拟内存（接口方法）"""
+        # 验证文件描述符有效性
+        if fd not in self.open_files:
+            return -EBADF
+
+        # 获取文件元信息
+        filename = self.open_files[fd]["filename"]
+        file_size = len(self.read_file(filename))
+
+        # 调用内存管理模块分配内存
+        try:
+            self.memory_mgr.map_memory(
+                pid=pid,
+                virtual_addr=virtual_addr,
+                size=file_size,
+                flags="FILE_MAP"
+            )
+            # 记录内存映射关系
+            self.memory_mappings[pid][virtual_addr] = {
+                "fd": fd,
+                "file_offset": 0,
+                "file_size": file_size
+            }
+            return 0
+        except MemoryError:
+            return -ENOMEM
+
+    def handle_swap(self, operation: str, page_info: dict) -> int:
+        """处理交换请求（由内存管理模块调用）"""
+        if operation == "out":
+            # 将内存页内容写回文件
+            fd = page_info["associated_fd"]
+            content = page_info["content"]
+            self.write_file(
+                self.open_files[fd]["filename"],
+                content,
+                mode="w"
+            )
+            return 0
+        elif operation == "in":
+            # 从文件加载内容到内存页
+            fd = page_info["associated_fd"]
+            content = self.read_file(
+                self.open_files[fd]["filename"]
+            )
+            return content
+        else:
+            return -EINVAL
+
+    # ----------------------------
+    # 与设备管理的接口
+    # ----------------------------
+    def block_io(self, operation: str, device_id: int, lba: int, data: bytes = None) -> int:
+        """块设备I/O接口"""
+        # 调用设备管理模块
+        if operation == "read":
+            return self.device_mgr.read_block(device_id, lba)
+        elif operation == "write":
+            if not data:
+                return -EINVAL
+            return self.device_mgr.write_block(device_id, lba, data)
+        else:
+            return -EOPNOTSUPP
+
+    # ----------------------------
+    # 辅助方法
+    # ----------------------------
+    def _navigate_to_path(self, path: list) -> dict:
+        """导航到指定路径并返回最后一级目录的引用"""
+        current = self.fs
+        for part in path:
+            if part not in current or current[part].get("_type") != "dir":
+                raise FileNotFoundError(f"Path component {part} not found")
+            current = current[part]
+        return current
 
     def _get_full_path(self, path: List[str]) -> List[str]:
         """解析相对/绝对路径"""
